@@ -27,12 +27,12 @@ pub enum WipePattern {
 }
 
 impl WipePattern {
-    pub fn etiket(&self) -> &'static str {
+    pub fn etiket(&self, dil: crate::lang::Dil) -> &'static str {
         match self {
-            Self::Zero => "Zero-Fill (1 geçiş, hızlı)",
-            Self::Random => "Random (1 geçiş rastgele veri)",
-            Self::DoD3 => "DoD 5220.22-M (3 geçiş: 0, 1, rastgele)",
-            Self::Gutmann => "Gutmann (35 geçiş, çok yavaş)",
+            Self::Zero => dil.wp_zero(),
+            Self::Random => dil.wp_random(),
+            Self::DoD3 => dil.wp_dod(),
+            Self::Gutmann => dil.wp_gutmann(),
         }
     }
 
@@ -126,7 +126,7 @@ pub fn wipe(
             .write(true)
             .custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH)
             .open(&windows_path)
-            .context("Diski açamadım. YÖNETİCİ olarak çalıştırın.")?;
+            .context("Cannot open disk. Run as administrator.")?;
 
         let mut buf = vec![0u8; BUF_SIZE];
         buffer_doldur(&mut buf, pattern, gecis, &mut seed);
@@ -138,8 +138,8 @@ pub fn wipe(
         while yazilan < boyut {
             if iptal.load(Ordering::Relaxed) {
                 let oran = ((gecis as f32) + yazilan as f32 / boyut as f32) / gecis_toplam as f32;
-                progress(oran, format!("İPTAL. Geçiş {}/{}, {} MB", gecis + 1, gecis_toplam, yazilan / 1_048_576));
-                return Err(anyhow!("Kullanıcı iptal etti"));
+                progress(oran, format!("CANCEL. Pass {}/{}, {} MB", gecis + 1, gecis_toplam, yazilan / 1_048_576));
+                return Err(anyhow!("Cancelled"));
             }
 
             let kalan = (boyut - yazilan) as usize;
@@ -165,7 +165,7 @@ pub fn wipe(
                 progress(
                     toplam_oran,
                     format!(
-                        "Geçiş {}/{}: {}/{} MB - {:.1} MB/s - Kalan: {} dk - Hata: {}",
+                        "Pass {}/{}: {}/{} MB - {:.1} MB/s - ETA: {} min - Err: {}",
                         gecis + 1, gecis_toplam, mb, toplam_mb, hiz, kalan_sn / 60, bad_count
                     ),
                 );
@@ -175,7 +175,7 @@ pub fn wipe(
         drop(file);
     }
 
-    progress(1.0, format!("Tamamlandı: {} geçiş", gecis_toplam));
+    progress(1.0, format!("Done: {} pass(es)", gecis_toplam));
     Ok(())
 }
 
@@ -235,7 +235,7 @@ pub fn zero_fill(
         .write(true)
         .custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH)
         .open(&windows_path)
-        .context("Diski açamadım. YÖNETİCİ olarak çalıştırin.")?;
+        .context("Cannot open disk. Run as administrator.")?;
 
     const BUF_SIZE: usize = 4 * 1024 * 1024;
     let buf = vec![0u8; BUF_SIZE];
@@ -247,8 +247,8 @@ pub fn zero_fill(
     while yazilan < boyut {
         if iptal.load(Ordering::Relaxed) {
             let oran = yazilan as f32 / boyut as f32;
-            progress(oran, format!("İPTAL EDILDI. {} MB yazıldı.", yazilan / 1_048_576));
-            return Err(anyhow!("Kullanıcı tarafindan iptal edildi"));
+            progress(oran, format!("CANCELLED. {} MB written.", yazilan / 1_048_576));
+            return Err(anyhow!("Cancelled"));
         }
 
         let kalan = (boyut - yazilan) as usize;
@@ -282,7 +282,7 @@ pub fn zero_fill(
         }
     }
 
-    progress(1.0, format!("Tamamlandı. {} bad sector remap edildi.", bad_count));
+    progress(1.0, format!("Done. {} bad sector(s) remapped.", bad_count));
     Ok(())
 }
 
@@ -297,22 +297,22 @@ pub fn zero_fill(
 
 pub fn secure_erase(disk: &str) -> Result<String> {
     let mut cikti = String::new();
-    cikti.push_str("=== SECURE ERASE HAZIRLIK ===\n\n");
+    cikti.push_str("=== SECURE ERASE ===\n\n");
 
-    let out = cmd("smartctl").args(["-g", "security", disk]).output()?;
+    let out = cmd(crate::embedded::smartctl_yol()).args(["-g", "security", disk]).output()?;
     let sec = String::from_utf8_lossy(&out.stdout).to_string();
     cikti.push_str(&sec);
     cikti.push('\n');
 
     if sec.contains("frozen") && !sec.contains("not frozen") {
-        cikti.push_str("\nDisk FROZEN durumda.\n");
-        cikti.push_str("Çözüm: PC'yi uyku moduna alin ve uyandırın, sonra tekrar deneyin.\n");
+        cikti.push_str("\nDisk is FROZEN.\n");
+        cikti.push_str("Fix: put PC to sleep and wake it, then try again.\n");
         return Ok(cikti);
     }
 
-    cikti.push_str("\nSecure Erase Windows'ta doğrudan smartctl ile yapılamıyor.\n");
-    cikti.push_str("Önerilen araçlar:\n");
-    cikti.push_str("  1. WD Data Lifeguard Diagnostic (WD5000AVDS icin resmi)\n");
+    cikti.push_str("\nSecure Erase cannot be done directly via smartctl on Windows.\n");
+    cikti.push_str("Recommended tools:\n");
+    cikti.push_str("  1. WD Data Lifeguard Diagnostic\n");
     cikti.push_str("     https://support.wdc.com/downloads.aspx\n");
     cikti.push_str("  2. Parted Magic (Linux Live USB)\n");
     cikti.push_str("  3. hdparm (Linux):\n");
@@ -359,7 +359,7 @@ fn disk_boyutu_windows(yol: &str) -> Result<u64> {
             FILE_FLAGS_AND_ATTRIBUTES(0),
             None,
         )
-        .context("Disk açılamadı (yönetici gerekli)")?;
+        .context("Cannot open disk (admin required)")?;
 
         let mut info = GET_LENGTH_INFORMATION::default();
         let mut ret: u32 = 0;
@@ -374,7 +374,7 @@ fn disk_boyutu_windows(yol: &str) -> Result<u64> {
             Some(&mut ret),
             None,
         )
-        .context("Disk boyutu okunamadı")?;
+        .context("Cannot read disk size")?;
 
         let _ = CloseHandle(handle);
         Ok(info.Length as u64)

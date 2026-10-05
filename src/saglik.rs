@@ -1,4 +1,5 @@
 use crate::smart::SmartAttribute;
+use crate::lang::Dil;
 
 #[derive(Debug, Clone)]
 pub struct SaglikSkoru {
@@ -19,13 +20,13 @@ pub enum SaglikDurumu {
 }
 
 impl SaglikDurumu {
-    pub fn etiket(&self) -> &'static str {
+    pub fn etiket(&self, dil: Dil) -> &'static str {
         match self {
-            Self::Mukemmel => "MÜKEMMEL",
-            Self::Iyi => "İYİ",
-            Self::Dikkat => "DİKKAT",
-            Self::Kotu => "KÖTÜ",
-            Self::Kritik => "KRİTİK - YEDEK AL",
+            Self::Mukemmel => dil.health_excellent(),
+            Self::Iyi => dil.health_good(),
+            Self::Dikkat => dil.health_caution(),
+            Self::Kotu => dil.health_bad(),
+            Self::Kritik => dil.health_critical(),
         }
     }
 
@@ -40,7 +41,7 @@ impl SaglikDurumu {
     }
 }
 
-pub fn hesapla(attrs: &[SmartAttribute], cikis_saati: Option<u64>) -> SaglikSkoru {
+pub fn hesapla(attrs: &[SmartAttribute], cikis_saati: Option<u64>, dil: Dil) -> SaglikSkoru {
     let mut puan: i32 = 100;
     let mut sebep = Vec::new();
     let mut oneri = Vec::new();
@@ -66,43 +67,43 @@ pub fn hesapla(attrs: &[SmartAttribute], cikis_saati: Option<u64>) -> SaglikSkor
     if reallocated > 0 {
         let ceza = ((reallocated as i32).min(1000) / 5).max(5);
         puan -= ceza;
-        sebep.push(format!("{} bozuk sektör remap edildi (SMART 5)", reallocated));
-        oneri.push("Zero-Fill çalıştır, pending sector'lari remap et".into());
+        sebep.push(dil.reallocated_reason(reallocated));
+        oneri.push(dil.reallocated_action().into());
     }
 
     if pending > 0 {
         puan -= 15 + (pending as i32 * 2).min(30);
-        sebep.push(format!("{} pending sector var (SMART 197) - okuma zorluyor", pending));
-        oneri.push("ACIL: Yedek al. Zero-Fill remap tetikleyebilir".into());
+        sebep.push(dil.pending_reason(pending));
+        oneri.push(dil.pending_action().into());
     }
 
     if uncorrectable > 0 {
         puan -= 25 + (uncorrectable as i32 * 3).min(40);
-        sebep.push(format!("{} düzeltilemez hata (SMART 198)", uncorrectable));
-        oneri.push("Diski değiştirin. Güvenilir değil".into());
+        sebep.push(dil.uncorrectable_reason(uncorrectable));
+        oneri.push(dil.uncorrectable_action().into());
     }
 
     if crc > 0 {
         let ceza = (crc as i32 / 2).min(20);
         puan -= ceza;
-        sebep.push(format!("{} CRC hatası (SMART 199) - kablo sorunu", crc));
-        oneri.push("SATA/USB kablosunu değiştirin".into());
+        sebep.push(dil.crc_reason(crc));
+        oneri.push(dil.crc_action().into());
     }
 
     if realloc_event > 0 && reallocated == 0 {
         puan -= 10;
-        sebep.push(format!("{} remap denemesi ama tamamlanmamis (SMART 196)", realloc_event));
+        sebep.push(dil.realloc_event_reason(realloc_event));
     }
 
     if reported_uncorrect > 0 {
         puan -= 15;
-        sebep.push(format!("{} rapor edilmis düzeltilemez hata (SMART 187)", reported_uncorrect));
+        sebep.push(dil.reported_reason(reported_uncorrect));
     }
 
     if cmd_timeout > 100 {
         puan -= 10;
-        sebep.push(format!("{} komut zaman aşımı (SMART 188)", cmd_timeout));
-        oneri.push("USB istasyonun gücünü / kablosunu kontrol edin".into());
+        sebep.push(dil.timeout_reason(cmd_timeout));
+        oneri.push(dil.timeout_action().into());
     }
 
     for &id in &[5u32, 197, 198, 199, 196, 187, 188] {
@@ -110,8 +111,8 @@ pub fn hesapla(attrs: &[SmartAttribute], cikis_saati: Option<u64>) -> SaglikSkor
         let t = thresh(id);
         if t > 0 && v <= t {
             puan -= 30;
-            sebep.push(format!("SMART {} eşiğin altina düştü (değer={} <= eşik={})", id, v, t));
-            oneri.push(format!("SMART {} kritik eşikte. Diski değiştirin", id));
+            sebep.push(dil.thresh_reason(id, v, t));
+            oneri.push(dil.thresh_action(id));
         }
     }
 
@@ -119,22 +120,22 @@ pub fn hesapla(attrs: &[SmartAttribute], cikis_saati: Option<u64>) -> SaglikSkor
         let sicaklik = t_raw.raw as i32;
         if sicaklik >= 60 {
             puan -= 20;
-            sebep.push(format!("Çok sicak: {} C (>= 60)", sicaklik));
-            oneri.push("Havalandırmayı artır. Sıcaklık arıza sebebi".into());
+            sebep.push(dil.hot_reason(sicaklik));
+            oneri.push(dil.hot_action().into());
         } else if sicaklik >= 55 {
             puan -= 10;
-            sebep.push(format!("Sıcak: {} C", sicaklik));
+            sebep.push(dil.warm_reason(sicaklik));
         }
     }
 
     if raw_read > 1_000_000 {
         puan -= 5;
-        sebep.push("Yüksek raw read error rate (SMART 1)".into());
+        sebep.push(dil.high_read_error().into());
     }
 
     if seek_error > 100_000_000 {
         puan -= 5;
-        sebep.push("Yüksek seek error rate (SMART 7)".into());
+        sebep.push(dil.high_seek_error().into());
     }
 
     let kalan_omur_yil = cikis_saati.map(|saat| {
@@ -163,10 +164,10 @@ pub fn hesapla(attrs: &[SmartAttribute], cikis_saati: Option<u64>) -> SaglikSkor
     };
 
     if sebep.is_empty() {
-        sebep.push("Bütün kritik değerler temiz. Disk sağlıklı.".into());
+        sebep.push(dil.all_clean().into());
     }
     if oneri.is_empty() && puan >= 90 {
-        oneri.push("Periyodik olarak trend kaydet, değişim yoksa endişe etme".into());
+        oneri.push(dil.default_advice().into());
     }
 
     SaglikSkoru {

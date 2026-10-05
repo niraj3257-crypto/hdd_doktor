@@ -17,7 +17,7 @@ fn cmd(program: &str) -> Command {
 }
 
 pub fn smartctl_kurulu_mu() -> bool {
-    cmd("smartctl").arg("--version").output().is_ok()
+    cmd(crate::embedded::smartctl_yol()).arg("--version").output().is_ok()
 }
 
 #[derive(Debug, Clone)]
@@ -53,7 +53,7 @@ pub fn smart_args<'a>(yol: &'a str, tip_flag: &'a Option<String>) -> Vec<String>
 }
 
 fn dene_bilgi(yol: &str, tip_flag: Option<&str>) -> Option<serde_json::Value> {
-    let mut c = cmd("smartctl");
+    let mut c = cmd(crate::embedded::smartctl_yol());
     if let Some(t) = tip_flag {
         c.args(["-d", t]);
     }
@@ -105,7 +105,7 @@ pub fn disk_listele() -> Result<Vec<DiskInfo>> {
     let mut diskler: Vec<DiskInfo> = Vec::new();
 
     if !cfg!(windows) {
-        let out = cmd("smartctl").args(["--scan-open", "-j"]).output()?;
+        let out = cmd(crate::embedded::smartctl_yol()).args(["--scan-open", "-j"]).output()?;
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
             if let Some(arr) = v.get("devices").and_then(|d| d.as_array()) {
                 for (idx, d) in arr.iter().enumerate() {
@@ -183,7 +183,7 @@ fn json_to_diskinfo(
         .get("model_name")
         .and_then(|x| x.as_str())
         .or_else(|| v.get("model_family").and_then(|x| x.as_str()))
-        .unwrap_or("Bilinmiyor")
+        .unwrap_or("Unknown")
         .to_string();
 
     let seri = v
@@ -248,7 +248,7 @@ fn json_to_diskinfo(
         .and_then(|x| x.as_u64())
         .unwrap_or(0);
     let sektor_boyutu = if mantiksal > 0 {
-        format!("{} / {} bayt", mantiksal, fiziksel)
+        format!("{} / {} B", mantiksal, fiziksel)
     } else {
         "-".into()
     };
@@ -258,12 +258,12 @@ fn json_to_diskinfo(
         .and_then(|x| x.as_bool())
         .map(|b| {
             if b {
-                "SAĞLIKLI".to_string()
+                "PASSED".to_string()
             } else {
-                "SORUNLU (FAILED)".to_string()
+                "FAILED".to_string()
             }
         })
-        .unwrap_or_else(|| "Bilinmiyor".into());
+        .unwrap_or_else(|| "UNKNOWN".into());
 
     let mut sicaklik = None;
     let mut cikis_saati = None;
@@ -297,7 +297,7 @@ fn json_to_diskinfo(
         }
         Some("nvme") => "NVMe".into(),
         Some(t) => t.to_string(),
-        None => "Doğrudan".into(),
+        None => "DIRECT".into(),
     };
 
     let goster = if kapasite_gb > 0.0 {
@@ -372,7 +372,7 @@ pub struct SmartAttribute {
 }
 
 pub fn nvme_smart_oku(disk: &str, tip_flag: &Option<String>) -> Option<Vec<SmartAttribute>> {
-    let mut c = cmd("smartctl");
+    let mut c = cmd(crate::embedded::smartctl_yol());
     if let Some(t) = tip_flag {
         c.args(["-d", t]);
     }
@@ -404,12 +404,12 @@ pub fn smart_oku(disk: &str, tip_flag: &Option<String>) -> Result<Vec<SmartAttri
         return Ok(nvme);
     }
 
-    let mut c = cmd("smartctl");
+    let mut c = cmd(crate::embedded::smartctl_yol());
     if let Some(t) = tip_flag {
         c.args(["-d", t]);
     }
     c.args(["-A", "-j", disk]);
-    let out = c.output().context("SMART okunamadı")?;
+    let out = c.output().context("SMART read failed")?;
 
     let v: serde_json::Value = serde_json::from_slice(&out.stdout)?;
     let mut sonuc = Vec::new();
@@ -442,7 +442,7 @@ pub fn smart_oku(disk: &str, tip_flag: &Option<String>) -> Result<Vec<SmartAttri
 }
 
 pub fn error_log(disk: &str, tip_flag: &Option<String>) -> Result<String> {
-    let mut c = cmd("smartctl");
+    let mut c = cmd(crate::embedded::smartctl_yol());
     if let Some(t) = tip_flag {
         c.args(["-d", t]);
     }
@@ -456,21 +456,18 @@ pub fn error_log(disk: &str, tip_flag: &Option<String>) -> Result<String> {
     }
 }
 
-pub fn sata_link_uyari(v: &crate::smart::DiskInfo) -> Option<String> {
+pub fn sata_link_yavas(v: &crate::smart::DiskInfo) -> bool {
     let h = v.sata_hiz.to_lowercase();
     if h.contains("sata 3") || h.contains("6.0 gb/s") || h.contains("sata iii") {
         if h.contains("3.0 gb/s") || h.contains("1.5 gb/s") {
-            return Some(format!(
-                "Disk SATA 3 destegi olmasina ragmen daha düşük hizda çalışıyor ({}). Kablo/port sorunu olabilir.",
-                v.sata_hiz
-            ));
+            return true;
         }
     }
-    None
+    false
 }
 
 pub fn self_test(disk: &str, tip: &str, tip_flag: &Option<String>) -> Result<String> {
-    let mut c = cmd("smartctl");
+    let mut c = cmd(crate::embedded::smartctl_yol());
     if let Some(t) = tip_flag {
         c.args(["-d", t]);
     }
@@ -480,7 +477,7 @@ pub fn self_test(disk: &str, tip: &str, tip_flag: &Option<String>) -> Result<Str
 }
 
 pub fn self_test_iptal(disk: &str, tip_flag: &Option<String>) -> Result<String> {
-    let mut c = cmd("smartctl");
+    let mut c = cmd(crate::embedded::smartctl_yol());
     if let Some(t) = tip_flag {
         c.args(["-d", t]);
     }
@@ -490,7 +487,7 @@ pub fn self_test_iptal(disk: &str, tip_flag: &Option<String>) -> Result<String> 
 }
 
 pub fn self_test_log(disk: &str, tip_flag: &Option<String>) -> Result<String> {
-    let mut c = cmd("smartctl");
+    let mut c = cmd(crate::embedded::smartctl_yol());
     if let Some(t) = tip_flag {
         c.args(["-d", t]);
     }
@@ -508,7 +505,7 @@ pub struct TestDurumu {
 }
 
 pub fn test_durumu(disk: &str, tip_flag: &Option<String>) -> Result<TestDurumu> {
-    let mut c = cmd("smartctl");
+    let mut c = cmd(crate::embedded::smartctl_yol());
     if let Some(t) = tip_flag {
         c.args(["-d", t]);
     }

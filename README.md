@@ -31,11 +31,10 @@ Bir doktor gibi — diskinin sağlığını canlı okur, kritik değerleri işar
 
 ### Önkoşullar
 
-1. **Rust** 1.75+ → https://rustup.rs
-2. **smartmontools** → https://www.smartmontools.org/wiki/Download#Windows
-   - Kurulumdan sonra `C:\Program Files\smartmontools\bin` **PATH**'e eklenmeli
-   - Doğrulama: `smartctl --version` komutu sürüm göstermeli
-3. **Yönetici hakları** — zero-fill, secure erase, raw disk I/O için gerekli
+1. **Rust** 1.75+ → https://rustup.rs (sadece derlemek istiyorsan)
+2. **Yönetici hakları** — zero-fill, secure erase, raw disk I/O için gerekli
+
+> `smartctl` exe'nin içinde gömülü olarak gelir, harici kurulum gerekmez.
 
 ### Derleme
 
@@ -83,6 +82,8 @@ src/
 ├── monitor.rs   # Trend kaydı (JSON append-only)
 ├── bildirim.rs  # notify-rust desktop notification
 ├── rapor.rs     # JSON/PDF rapor çıktısı
+├── embedded.rs  # smartctl.exe gömülü çıkartma
+├── lang.rs      # TR/EN dil desteği
 └── tema.rs      # egui dark theme + renk paleti
 ```
 

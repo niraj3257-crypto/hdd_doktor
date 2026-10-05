@@ -5,6 +5,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use crate::smart::{self, SmartAttribute};
+use crate::lang::Dil;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct TrendKayit {
@@ -43,10 +44,10 @@ pub fn trend_kaydet(disk: &str, tip_flag: &Option<String>) -> Result<String> {
     Ok(dosya.display().to_string())
 }
 
-pub fn trend_ozet(disk: &str) -> Result<String> {
+pub fn trend_ozet(disk: &str, dil: Dil) -> Result<String> {
     let dosya = trend_dosyasi(disk);
     if !dosya.exists() {
-        return Ok("Henuz kayıt yok. Önce 'Trend Kaydet' çalıştırin.".into());
+        return Ok(dil.no_trend_yet().into());
     }
     let icerik = fs::read_to_string(&dosya)?;
     let kayitlar: Vec<TrendKayit> = icerik
@@ -55,24 +56,26 @@ pub fn trend_ozet(disk: &str) -> Result<String> {
         .collect();
 
     if kayitlar.len() < 2 {
-        return Ok(format!(
-            "Karşılaştırma için en az 2 kayıt gerekli. Mevcut: {}",
-            kayitlar.len()
-        ));
+        return Ok(dil.need_two_records(kayitlar.len()));
     }
 
     let ilk = &kayitlar[0];
     let son = &kayitlar[kayitlar.len() - 1];
 
+    let col_first = match dil { Dil::Tr => "İlk", Dil::En => "First" };
+    let col_last = match dil { Dil::Tr => "Son", Dil::En => "Last" };
+    let col_change = match dil { Dil::Tr => "Değişim", Dil::En => "Change" };
+    let records_label = match dil { Dil::Tr => "Kayıt sayısı", Dil::En => "Record count" };
+
     let mut s = String::new();
     s.push_str(&format!(
-        "=== TREND ANALİZİ ({} -> {}) ===\n",
-        ilk.tarih, son.tarih
+        "=== {} ({} -> {}) ===\n",
+        dil.trend_analysis(), ilk.tarih, son.tarih
     ));
-    s.push_str(&format!("Kayıt sayısı: {}\n\n", kayitlar.len()));
+    s.push_str(&format!("{}: {}\n\n", records_label, kayitlar.len()));
     s.push_str(&format!(
         "{:>4} {:<28} {:>10} {:>10} {:>10}\n",
-        "ID", "İsim", "Ilk", "Son", "Değişim"
+        "ID", dil.col_name(), col_first, col_last, col_change
     ));
     s.push_str(&"-".repeat(70));
     s.push('\n');

@@ -7,11 +7,14 @@ mod saglik;
 mod bildirim;
 mod tema;
 mod rapor;
+mod embedded;
+mod lang;
 
 use eframe::egui::{self, Color32, RichText};
 use smart::{DiskInfo, SmartAttribute, TestDurumu};
-use saglik::{SaglikSkoru, SaglikDurumu};
+use saglik::SaglikSkoru;
 use tema::Tema;
+use lang::Dil;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -23,7 +26,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([1000.0, 640.0])
-            .with_title("HDD Doktor - Disk Teşhis ve Onarım Merkezi"),
+            .with_title("HDD Doktor"),
         ..Default::default()
     };
 
@@ -40,7 +43,6 @@ fn main() -> eframe::Result<()> {
 
 #[derive(Clone)]
 enum LogMsg {
-    Info(String),
     Ok(String),
     Warn(String),
     Err(String),
@@ -55,7 +57,6 @@ enum WorkerMsg {
     UzunMetin(String, String),
     TestIlerleme(TestDurumu),
     TestBitti,
-    SicaklikOrnek(f32, i32),
     Bildirim(String, String, bool),
 }
 
@@ -73,6 +74,7 @@ struct HddDoktorApp {
     aktif_sekme: Sekme,
     uzun_metinler: Vec<(String, String)>,
     tema: Tema,
+    dil: Dil,
     iptal_bayragi: Arc<AtomicBool>,
     test_durumu: Option<TestDurumu>,
     test_baslama: Option<Instant>,
@@ -99,6 +101,7 @@ impl HddDoktorApp {
     fn new(tema: Tema) -> Self {
         let (tx, rx) = channel();
         let smartctl_ok = smart::smartctl_kurulu_mu();
+        let dil = Dil::Tr;
 
         let mut app = Self {
             diskler: Vec::new(),
@@ -114,6 +117,7 @@ impl HddDoktorApp {
             aktif_sekme: Sekme::Ozet,
             uzun_metinler: Vec::new(),
             tema,
+            dil,
             iptal_bayragi: Arc::new(AtomicBool::new(false)),
             test_durumu: None,
             test_baslama: None,
@@ -127,11 +131,9 @@ impl HddDoktorApp {
         };
 
         if !smartctl_ok {
-            app.log_lines.push(LogMsg::Err(
-                "smartctl bulunamadı. https://www.smartmontools.org/wiki/Download#Windows adresinden kurun.".into()
-            ));
+            app.log_lines.push(LogMsg::Err(dil.smartctl_init_fail().into()));
         } else {
-            app.log_lines.push(LogMsg::Ok("smartctl bulundu. Diskler taraniyor...".into()));
+            app.log_lines.push(LogMsg::Ok(dil.smartctl_ready().into()));
             app.diskleri_yenile();
         }
 
@@ -140,14 +142,15 @@ impl HddDoktorApp {
 
     fn diskleri_yenile(&mut self) {
         let tx = self.tx.clone();
+        let dil = self.dil;
         self.calisiyor = true;
         thread::spawn(move || match smart::disk_listele() {
             Ok(d) => {
-                let _ = tx.send(WorkerMsg::Log(LogMsg::Ok(format!("{} disk bulundu", d.len()))));
+                let _ = tx.send(WorkerMsg::Log(LogMsg::Ok(dil.disks_found(d.len()))));
                 let _ = tx.send(WorkerMsg::Diskler(d));
             }
             Err(e) => {
-                let _ = tx.send(WorkerMsg::Log(LogMsg::Err(format!("Disk hatası: {}", e))));
+                let _ = tx.send(WorkerMsg::Log(LogMsg::Err(dil.disk_error(&e.to_string()))));
                 let _ = tx.send(WorkerMsg::Diskler(Vec::new()));
             }
         });
@@ -157,17 +160,15 @@ impl HddDoktorApp {
         let Some(idx) = self.secili else { return };
         let d = self.diskler[idx].clone();
         let tx = self.tx.clone();
+        let dil = self.dil;
         self.calisiyor = true;
         thread::spawn(move || match smart::smart_oku(&d.yol, &d.tip_flag) {
             Ok(a) => {
-                let _ = tx.send(WorkerMsg::Log(LogMsg::Ok(format!(
-                    "SMART okundu ({} attribute)",
-                    a.len()
-                ))));
+                let _ = tx.send(WorkerMsg::Log(LogMsg::Ok(dil.smart_read_ok(a.len()))));
                 let _ = tx.send(WorkerMsg::Smart(a));
             }
             Err(e) => {
-                let _ = tx.send(WorkerMsg::Log(LogMsg::Err(format!("SMART hatası: {}", e))));
+                let _ = tx.send(WorkerMsg::Log(LogMsg::Err(dil.smart_error(&e.to_string()))));
                 let _ = tx.send(WorkerMsg::Smart(Vec::new()));
             }
         });
@@ -177,6 +178,7 @@ impl HddDoktorApp {
         let Some(idx) = self.secili else { return };
         let d = self.diskler[idx].clone();
         let tx = self.tx.clone();
+        let dil = self.dil;
         self.calisiyor = true;
         self.iptal_bayragi.store(false, Ordering::Relaxed);
         self.test_baslama = Some(Instant::now());
@@ -185,14 +187,11 @@ impl HddDoktorApp {
         thread::spawn(move || {
             match smart::self_test(&d.yol, tip, &d.tip_flag) {
                 Ok(s) => {
-                    let _ = tx.send(WorkerMsg::Log(LogMsg::Ok(format!("Test başlatıldı ({})", tip))));
-                    let _ = tx.send(WorkerMsg::UzunMetin(
-                        format!("Self-Test Başlatma Çıktısı ({})", tip),
-                        s,
-                    ));
+                    let _ = tx.send(WorkerMsg::Log(LogMsg::Ok(dil.test_started(tip))));
+                    let _ = tx.send(WorkerMsg::UzunMetin(dil.test_output_title(tip), s));
                 }
                 Err(e) => {
-                    let _ = tx.send(WorkerMsg::Log(LogMsg::Err(format!("Test hatası: {}", e))));
+                    let _ = tx.send(WorkerMsg::Log(LogMsg::Err(dil.test_error(&e.to_string()))));
                     let _ = tx.send(WorkerMsg::ProgressDone);
                     return;
                 }
@@ -211,9 +210,9 @@ impl HddDoktorApp {
             loop {
                 if iptal.load(Ordering::Relaxed) {
                     let _ = smart::self_test_iptal(&d.yol, &d.tip_flag);
-                    let _ = tx.send(WorkerMsg::Log(LogMsg::Warn("Test İPTAL edildi".into())));
+                    let _ = tx.send(WorkerMsg::Log(LogMsg::Warn(dil.test_cancelled().into())));
                     if let Ok(log) = smart::self_test_log(&d.yol, &d.tip_flag) {
-                        let _ = tx.send(WorkerMsg::UzunMetin("Self-Test Sonucu (iptal)".into(), log));
+                        let _ = tx.send(WorkerMsg::UzunMetin(dil.test_result_cancel().into(), log));
                     }
                     let _ = tx.send(WorkerMsg::TestBitti);
                     return;
@@ -233,31 +232,28 @@ impl HddDoktorApp {
                         if bitti_temiz || zaman_asimi {
                             thread::sleep(Duration::from_secs(2));
                             let log = smart::self_test_log(&d.yol, &d.tip_flag)
-                                .unwrap_or_else(|e| format!("Sonuç okunamadı: {}", e));
+                                .unwrap_or_else(|e| format!("{}: {}", dil.test_error(""), e));
 
-                            let _ = tx.send(WorkerMsg::UzunMetin("Self-Test Sonucu".into(), log.clone()));
+                            let _ = tx.send(WorkerMsg::UzunMetin(dil.test_result().into(), log.clone()));
 
                             let sonuc_ozeti = if log.contains("Completed without error") {
-                                "Test BAŞARIYLA tamamlandı"
+                                dil.test_passed()
                             } else if log.contains("read failure") || log.contains("failed") {
-                                "Test HATALI bitti - okuma hatası var"
+                                dil.test_failed()
                             } else if zaman_asimi {
-                                "Test zaman aşımına uğradı"
+                                dil.test_timeout()
                             } else {
-                                "Test bitti"
+                                dil.test_done_short()
                             };
 
-                            let _ = tx.send(WorkerMsg::Bildirim("Self-Test Bitti".into(), sonuc_ozeti.into(), false));
+                            let _ = tx.send(WorkerMsg::Bildirim(dil.test_done_notif().into(), sonuc_ozeti.into(), false));
                             let _ = tx.send(WorkerMsg::Log(LogMsg::Ok(sonuc_ozeti.into())));
                             let _ = tx.send(WorkerMsg::TestBitti);
                             return;
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(WorkerMsg::Log(LogMsg::Warn(format!(
-                            "Durum sorgu hatası: {} (devam)",
-                            e
-                        ))));
+                        let _ = tx.send(WorkerMsg::Log(LogMsg::Warn(format!("{}: {}", dil.test_error(""), e))));
                     }
                 }
 
@@ -271,10 +267,11 @@ impl HddDoktorApp {
         let Some(idx) = self.secili else { return };
         let d = self.diskler[idx].clone();
         let tx = self.tx.clone();
+        let dil = self.dil;
         self.calisiyor = true;
         thread::spawn(move || match smart::self_test_log(&d.yol, &d.tip_flag) {
             Ok(s) => {
-                let _ = tx.send(WorkerMsg::UzunMetin("Self-Test Log Detayi".into(), s));
+                let _ = tx.send(WorkerMsg::UzunMetin(dil.test_log_title().into(), s));
                 let _ = tx.send(WorkerMsg::ProgressDone);
             }
             Err(e) => {
@@ -288,10 +285,11 @@ impl HddDoktorApp {
         let Some(idx) = self.secili else { return };
         let d = self.diskler[idx].clone();
         let tx = self.tx.clone();
+        let dil = self.dil;
         self.calisiyor = true;
         thread::spawn(move || match smart::error_log(&d.yol, &d.tip_flag) {
             Ok(s) => {
-                let _ = tx.send(WorkerMsg::UzunMetin("Genişletilmiş Hata Log'u".into(), s));
+                let _ = tx.send(WorkerMsg::UzunMetin(dil.error_log_title().into(), s));
                 let _ = tx.send(WorkerMsg::ProgressDone);
             }
             Err(e) => {
@@ -305,14 +303,15 @@ impl HddDoktorApp {
         let Some(idx) = self.secili else { return };
         let d = self.diskler[idx].clone();
         let tx = self.tx.clone();
+        let dil = self.dil;
         self.calisiyor = true;
         thread::spawn(move || match monitor::trend_kaydet(&d.yol, &d.tip_flag) {
             Ok(p) => {
-                let _ = tx.send(WorkerMsg::Log(LogMsg::Ok(format!("Trend kaydedildi: {}", p))));
+                let _ = tx.send(WorkerMsg::Log(LogMsg::Ok(dil.trend_saved(&p))));
                 let _ = tx.send(WorkerMsg::ProgressDone);
             }
             Err(e) => {
-                let _ = tx.send(WorkerMsg::Log(LogMsg::Err(format!("Trend hatası: {}", e))));
+                let _ = tx.send(WorkerMsg::Log(LogMsg::Err(dil.trend_error(&e.to_string()))));
                 let _ = tx.send(WorkerMsg::ProgressDone);
             }
         });
@@ -322,10 +321,11 @@ impl HddDoktorApp {
         let Some(idx) = self.secili else { return };
         let d = self.diskler[idx].clone();
         let tx = self.tx.clone();
+        let dil = self.dil;
         self.calisiyor = true;
-        thread::spawn(move || match monitor::trend_ozet(&d.yol) {
+        thread::spawn(move || match monitor::trend_ozet(&d.yol, dil) {
             Ok(s) => {
-                let _ = tx.send(WorkerMsg::UzunMetin("Trend Analizi".into(), s));
+                let _ = tx.send(WorkerMsg::UzunMetin(dil.trend_analysis().into(), s));
                 let _ = tx.send(WorkerMsg::ProgressDone);
             }
             Err(e) => {
@@ -339,9 +339,10 @@ impl HddDoktorApp {
         let Some(idx) = self.secili else { return };
         let d = self.diskler[idx].clone();
         let tx = self.tx.clone();
+        let dil = self.dil;
         self.calisiyor = true;
         self.iptal_bayragi.store(false, Ordering::Relaxed);
-        self.ilerleme = Some((0.0, "Başlatiliyor...".into()));
+        self.ilerleme = Some((0.0, dil.starting().into()));
         let iptal = self.iptal_bayragi.clone();
 
         thread::spawn(move || {
@@ -351,17 +352,15 @@ impl HddDoktorApp {
             };
             match disk::zero_fill(&d.yol, iptal, cb) {
                 Ok(_) => {
-                    let _ = tx.send(WorkerMsg::Log(LogMsg::Ok(
-                        "Zero-fill tamam. SMART 5 kontrol edin.".into(),
-                    )));
+                    let _ = tx.send(WorkerMsg::Log(LogMsg::Ok(dil.zerofill_done().into())));
                     let _ = tx.send(WorkerMsg::Bildirim(
-                        "Zero-Fill Bitti".into(),
-                        "Disk sıfırla dolduruldu. SMART kontrol edin.".into(),
+                        dil.zerofill_notif_title().into(),
+                        dil.zerofill_notif_body().into(),
                         false,
                     ));
                 }
                 Err(e) => {
-                    let _ = tx.send(WorkerMsg::Log(LogMsg::Err(format!("Zero-fill: {}", e))));
+                    let _ = tx.send(WorkerMsg::Log(LogMsg::Err(dil.wipe_error(&e.to_string()))));
                 }
             }
             let _ = tx.send(WorkerMsg::ProgressDone);
@@ -387,7 +386,7 @@ impl HddDoktorApp {
 
     fn iptal_et(&mut self) {
         self.iptal_bayragi.store(true, Ordering::Relaxed);
-        self.log_lines.push(LogMsg::Warn("İptal istegi gönderildi...".into()));
+        self.log_lines.push(LogMsg::Warn(self.dil.cancel_sent().into()));
     }
 
     fn saglik_hesapla(&mut self) {
@@ -396,11 +395,12 @@ impl HddDoktorApp {
                 .secili
                 .and_then(|i| self.diskler.get(i))
                 .and_then(|d| d.cikis_saati);
-            self.saglik = Some(saglik::hesapla(&self.smart_attrs, saat));
+            self.saglik = Some(saglik::hesapla(&self.smart_attrs, saat, self.dil));
         }
     }
 
     fn mesaj_isle(&mut self, ctx: &egui::Context) {
+        let dil = self.dil;
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 WorkerMsg::Log(l) => self.log_lines.push(l),
@@ -424,12 +424,10 @@ impl HddDoktorApp {
                                     self.sicaklik_gecmisi.remove(0);
                                 }
                                 if t >= 60 {
-                                    self.log_lines.push(LogMsg::Err(format!(
-                                        "SICAKLIK ALARMI: {} C - Disk yanabilir!", t
-                                    )));
+                                    self.log_lines.push(LogMsg::Err(dil.temp_alarm(t)));
                                     let _ = self.tx.send(WorkerMsg::Bildirim(
-                                        "SICAKLIK KRİTİK".into(),
-                                        format!("Disk sıcaklığı {} C - havalandırın", t),
+                                        dil.temp_critical().into(),
+                                        dil.temp_critical_body(t),
                                         true,
                                     ));
                                 }
@@ -457,7 +455,6 @@ impl HddDoktorApp {
                     self.test_baslama = None;
                     self.calisiyor = false;
                 }
-                WorkerMsg::SicaklikOrnek(_, _) => {}
                 WorkerMsg::Bildirim(b, m, k) => {
                     bildirim::bildir(&b, &m, k);
                 }
@@ -509,28 +506,31 @@ impl eframe::App for HddDoktorApp {
 impl HddDoktorApp {
     fn ust_serit(&mut self, ctx: &egui::Context) {
         let p = self.tema.palet();
+        let dil = self.dil;
         egui::TopBottomPanel::top("ust")
             .exact_height(52.0)
             .frame(egui::Frame::default().fill(p.arka_ikinci).inner_margin(egui::Margin::symmetric(16.0, 10.0)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("HDD DOKTOR")
-                            .size(20.0)
-                            .strong()
-                            .color(p.mavi),
-                    );
-                    ui.label(RichText::new("  v0.3").color(p.metin_soluk));
+                    ui.label(RichText::new(dil.app_name()).size(20.0).strong().color(p.mavi));
+                    ui.label(RichText::new(dil.version()).color(p.metin_soluk));
                     ui.separator();
-                    ui.label(RichText::new(format!("{} disk", self.diskler.len())).color(p.metin_soluk));
+                    ui.label(RichText::new(dil.n_disks(self.diskler.len())).color(p.metin_soluk));
 
                     if !self.smartctl_ok {
                         ui.separator();
-                        ui.colored_label(p.kirmizi, RichText::new("smartctl YOK").strong());
+                        ui.colored_label(p.kirmizi, RichText::new(dil.smartctl_missing()).strong());
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let tema_metin = if self.tema == Tema::Karanlik { "Aydınlık Tema" } else { "Karanlık Tema" };
+                        if ui.button(dil.language_label()).clicked() {
+                            self.dil = match self.dil {
+                                Dil::Tr => Dil::En,
+                                Dil::En => Dil::Tr,
+                            };
+                            self.saglik_hesapla();
+                        }
+                        let tema_metin = if self.tema == Tema::Karanlik { dil.light_theme() } else { dil.dark_theme() };
                         if ui.button(tema_metin).clicked() {
                             self.tema = if self.tema == Tema::Karanlik {
                                 Tema::Aydinlik
@@ -539,11 +539,8 @@ impl HddDoktorApp {
                             };
                             self.tema.uygula(ctx);
                         }
-                        ui.checkbox(&mut self.otomatik_yenile, "Otomatik yenile (30 sn)");
-                        if ui
-                            .add_enabled(!self.calisiyor, egui::Button::new("Diskleri Tara"))
-                            .clicked()
-                        {
+                        ui.checkbox(&mut self.otomatik_yenile, dil.auto_refresh());
+                        if ui.add_enabled(!self.calisiyor, egui::Button::new(dil.scan_disks())).clicked() {
                             self.diskleri_yenile();
                         }
                         if self.calisiyor {
@@ -556,6 +553,7 @@ impl HddDoktorApp {
 
     fn sol_disk_paneli(&mut self, ctx: &egui::Context) {
         let p = self.tema.palet();
+        let dil = self.dil;
         egui::SidePanel::left("sol")
             .exact_width(280.0)
             .resizable(false)
@@ -565,19 +563,19 @@ impl HddDoktorApp {
                     .inner_margin(egui::Margin::same(12.0)),
             )
             .show(ctx, |ui| {
-                ui.label(RichText::new("DİSKLER").size(12.0).strong().color(p.metin_soluk));
+                ui.label(RichText::new(dil.disks_header()).size(12.0).strong().color(p.metin_soluk));
                 ui.add_space(6.0);
 
                 if self.diskler.is_empty() {
-                    ui.label(RichText::new("Disk bulunamadı").color(p.metin_soluk));
-                    ui.label(RichText::new("Yönetici olarak çalıştırin").color(p.sari).size(11.0));
+                    ui.label(RichText::new(dil.no_disk_found()).color(p.metin_soluk));
+                    ui.label(RichText::new(dil.run_as_admin()).color(p.sari).size(11.0));
                     return;
                 }
 
                 let mut yeni_secim: Option<usize> = None;
                 for (i, d) in self.diskler.iter().enumerate() {
                     let secili = self.secili == Some(i);
-                    if disk_kart(ui, d, secili, &p) {
+                    if disk_kart(ui, d, secili, &p, dil) {
                         yeni_secim = Some(i);
                     }
                     ui.add_space(6.0);
@@ -594,6 +592,7 @@ impl HddDoktorApp {
 
     fn alt_log_paneli(&mut self, ctx: &egui::Context) {
         let p = self.tema.palet();
+        let dil = self.dil;
         egui::TopBottomPanel::bottom("alt")
             .resizable(true)
             .default_height(140.0)
@@ -601,13 +600,13 @@ impl HddDoktorApp {
             .frame(egui::Frame::default().fill(p.arka_ikinci).inner_margin(egui::Margin::same(10.0)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("KAYIT").strong().color(p.metin_soluk));
+                    ui.label(RichText::new(dil.log_header()).strong().color(p.metin_soluk));
                     ui.separator();
-                    if ui.small_button("Temizle").clicked() {
+                    if ui.small_button(dil.clear()).clicked() {
                         self.log_lines.clear();
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(format!("{} kayıt", self.log_lines.len())).color(p.metin_soluk).size(11.0));
+                        ui.label(RichText::new(dil.n_records(self.log_lines.len())).color(p.metin_soluk).size(11.0));
                     });
                 });
                 ui.separator();
@@ -617,7 +616,6 @@ impl HddDoktorApp {
                     .show(ui, |ui| {
                         for l in &self.log_lines {
                             match l {
-                                LogMsg::Info(s) => { ui.label(RichText::new(s).color(p.metin)); }
                                 LogMsg::Ok(s) => { ui.colored_label(p.yesil, format!("[OK]  {}", s)); }
                                 LogMsg::Warn(s) => { ui.colored_label(p.sari, format!("!  {}", s)); }
                                 LogMsg::Err(s) => { ui.colored_label(p.kirmizi, format!("[X]   {}", s)); }
@@ -629,13 +627,14 @@ impl HddDoktorApp {
 
     fn orta_panel(&mut self, ctx: &egui::Context) {
         let p = self.tema.palet();
+        let dil = self.dil;
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(p.arka_ana).inner_margin(egui::Margin::same(16.0)))
             .show(ctx, |ui| {
                 let Some(idx) = self.secili else {
                     ui.vertical_centered(|ui| {
                         ui.add_space(60.0);
-                        ui.label(RichText::new("Disk seçin").size(20.0).color(p.metin_soluk));
+                        ui.label(RichText::new(dil.select_disk()).size(20.0).color(p.metin_soluk));
                     });
                     return;
                 };
@@ -669,6 +668,7 @@ impl HddDoktorApp {
     }
 
     fn disk_baslik_karti(&self, ui: &mut egui::Ui, d: &DiskInfo, p: &tema::Palet) {
+        let dil = self.dil;
         egui::Frame::default()
             .fill(p.arka_kart)
             .rounding(8.0)
@@ -682,10 +682,10 @@ impl HddDoktorApp {
                         ui.horizontal(|ui| {
                             etiket_kart(ui, &format!("{:.0} GB", d.kapasite_gb), p.mavi);
                             etiket_kart(ui, &d.tip, p.mor);
-                            etiket_kart(ui, &d.baglanti, p.metin_soluk);
+                            etiket_kart(ui, &dil.translate_conn(&d.baglanti), p.metin_soluk);
                             if let Some(t) = d.sicaklik {
                                 let renk = if t >= 60 { p.kirmizi } else if t >= 55 { p.turuncu } else if t >= 45 { p.sari } else { p.yesil };
-                                etiket_kart(ui, &format!("{} C", t), renk);
+                                etiket_kart(ui, &format!("{} °C", t), renk);
                             }
                         });
                     });
@@ -699,9 +699,9 @@ impl HddDoktorApp {
                                     ui.label(RichText::new(format!("{}", s.puan)).size(38.0).strong().color(renk));
                                     ui.label(RichText::new("/100").size(18.0).color(p.metin_soluk));
                                 });
-                                ui.label(RichText::new(s.durum.etiket()).strong().color(renk));
+                                ui.label(RichText::new(s.durum.etiket(dil)).strong().color(renk));
                                 if let Some(y) = s.kalan_omur_yil {
-                                    ui.label(RichText::new(format!("Tahmini ömür: ~{:.1} yil", y)).color(p.metin_soluk).size(11.0));
+                                    ui.label(RichText::new(dil.est_life(y)).color(p.metin_soluk).size(11.0));
                                 }
                             });
                         } else {
@@ -713,6 +713,7 @@ impl HddDoktorApp {
     }
 
     fn ilerleme_karti(&mut self, ui: &mut egui::Ui, oran: f32, msg: &str, p: &tema::Palet) {
+        let dil = self.dil;
         egui::Frame::default()
             .fill(p.arka_kart)
             .rounding(8.0)
@@ -720,9 +721,9 @@ impl HddDoktorApp {
             .stroke(egui::Stroke::new(1.0, p.turuncu))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("İŞLEM").strong().color(p.turuncu));
+                    ui.label(RichText::new(dil.operation()).strong().color(p.turuncu));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(RichText::new("[ İPTAL ET ]").color(p.kirmizi)).clicked() {
+                        if ui.button(RichText::new(dil.cancel()).color(p.kirmizi)).clicked() {
                             self.iptal_et();
                         }
                     });
@@ -734,6 +735,7 @@ impl HddDoktorApp {
     }
 
     fn test_ilerleme_karti(&mut self, ui: &mut egui::Ui, td: &TestDurumu, p: &tema::Palet) {
+        let dil = self.dil;
         let ilerleme = (100 - td.kalan_yuzde) as f32 / 100.0;
         egui::Frame::default()
             .fill(p.arka_kart)
@@ -744,13 +746,10 @@ impl HddDoktorApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("SELF-TEST").strong().color(p.mavi));
                     if let Some(bas) = self.test_baslama {
-                        ui.label(
-                            RichText::new(format!("| Geçen: {:.0} sn", bas.elapsed().as_secs_f32()))
-                                .color(p.metin_soluk),
-                        );
+                        ui.label(RichText::new(dil.elapsed_secs(bas.elapsed().as_secs_f32())).color(p.metin_soluk));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(RichText::new("[ TESTI DURDUR ]").color(p.kirmizi)).clicked() {
+                        if ui.button(RichText::new(dil.stop_test()).color(p.kirmizi)).clicked() {
                             self.iptal_et();
                         }
                     });
@@ -762,14 +761,15 @@ impl HddDoktorApp {
     }
 
     fn sekme_bari(&mut self, ui: &mut egui::Ui, p: &tema::Palet) {
+        let dil = self.dil;
         ui.horizontal(|ui| {
             for (s, ad) in [
-                (Sekme::Ozet, "Özet"),
-                (Sekme::Smart, "SMART Detay"),
-                (Sekme::Testler, "Testler & Çıktılar"),
-                (Sekme::Bakim, "Bakım & Onarım"),
-                (Sekme::Trend, "Trend"),
-                (Sekme::Rapor, "Rapor"),
+                (Sekme::Ozet, dil.tab_overview()),
+                (Sekme::Smart, dil.tab_smart()),
+                (Sekme::Testler, dil.tab_tests()),
+                (Sekme::Bakim, dil.tab_maintenance()),
+                (Sekme::Trend, dil.tab_trend()),
+                (Sekme::Rapor, dil.tab_report()),
             ] {
                 let secili = self.aktif_sekme == s;
                 let renk = if secili { p.mavi } else { p.metin_soluk };
@@ -784,28 +784,29 @@ impl HddDoktorApp {
     }
 
     fn sekme_ozet(&self, ui: &mut egui::Ui, d: &DiskInfo, p: &tema::Palet) {
+        let dil = self.dil;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.columns(2, |kols| {
-                kart_ic(&mut kols[0], "GENEL", p, |ui| {
-                    self.bilgi_satir(ui, "Model", &d.model, p);
-                    self.bilgi_satir(ui, "Seri No", &d.seri, p);
-                    self.bilgi_satir(ui, "Firmware", &d.firmware, p);
-                    self.bilgi_satir(ui, "Kapasite", &format!("{:.1} GB", d.kapasite_gb), p);
-                    self.bilgi_satir(ui, "Tip", &d.tip, p);
-                    self.bilgi_satir(ui, "Form Faktoru", &d.form_faktoru, p);
+                kart_ic(&mut kols[0], dil.general(), p, |ui| {
+                    self.bilgi_satir(ui, dil.model(), &d.model, p);
+                    self.bilgi_satir(ui, dil.serial(), &d.seri, p);
+                    self.bilgi_satir(ui, dil.firmware(), &d.firmware, p);
+                    self.bilgi_satir(ui, dil.capacity(), &format!("{:.1} GB", d.kapasite_gb), p);
+                    self.bilgi_satir(ui, dil.disk_type(), &d.tip, p);
+                    self.bilgi_satir(ui, dil.form_factor(), &d.form_faktoru, p);
                 });
 
-                kart_ic(&mut kols[1], "BAĞLANTI", p, |ui| {
-                    self.bilgi_satir(ui, "Bağlantı", &d.baglanti, p);
-                    self.bilgi_satir(ui, "Arayüz", &d.arayuz, p);
+                kart_ic(&mut kols[1], dil.connection(), p, |ui| {
+                    self.bilgi_satir(ui, dil.conn_label(), &dil.translate_conn(&d.baglanti), p);
+                    self.bilgi_satir(ui, dil.interface(), &d.arayuz, p);
                     self.bilgi_satir(ui, "SATA", &d.sata_hiz, p);
-                    self.bilgi_satir(ui, "Sektör", &d.sektor_boyutu, p);
-                    self.bilgi_satir(ui, "Windows Surucusu", &d.aktif_alan, p);
-                    self.bilgi_satir(ui, "Disk Yolu", &d.yol, p);
+                    self.bilgi_satir(ui, dil.sector(), &d.sektor_boyutu, p);
+                    self.bilgi_satir(ui, dil.win_drive(), &d.aktif_alan, p);
+                    self.bilgi_satir(ui, dil.disk_path(), &d.yol, p);
 
-                    if let Some(uyari) = smart::sata_link_uyari(d) {
+                    if smart::sata_link_yavas(d) {
                         ui.add_space(4.0);
-                        ui.colored_label(p.sari, format!("!  {}", uyari));
+                        ui.colored_label(p.sari, format!("!  {}", dil.sata_link_warn(&d.sata_hiz)));
                     }
                 });
             });
@@ -813,21 +814,21 @@ impl HddDoktorApp {
             ui.add_space(10.0);
 
             ui.columns(2, |kols| {
-                kart_ic(&mut kols[0], "DURUM", p, |ui| {
-                    let sic = d.sicaklik.map(|t| format!("{} C", t)).unwrap_or("-".into());
-                    self.bilgi_satir(ui, "Sıcaklık", &sic, p);
-                    let saat = d.cikis_saati.map(|s| format!("{} saat  (~{:.1} yil)", s, s as f64 / 8760.0)).unwrap_or("-".into());
-                    self.bilgi_satir(ui, "Çalışma Süresi", &saat, p);
+                kart_ic(&mut kols[0], dil.status(), p, |ui| {
+                    let sic = d.sicaklik.map(|t| format!("{} °C", t)).unwrap_or("-".into());
+                    self.bilgi_satir(ui, dil.temperature(), &sic, p);
+                    let saat = d.cikis_saati.map(|s| dil.hours_fmt(s)).unwrap_or("-".into());
+                    self.bilgi_satir(ui, dil.uptime(), &saat, p);
                     let guc = d.guc_dongusu.map(|g| g.to_string()).unwrap_or("-".into());
-                    self.bilgi_satir(ui, "Güç Döngüsü", &guc, p);
-                    self.bilgi_satir(ui, "SMART Sağlık", &d.saglik, p);
+                    self.bilgi_satir(ui, dil.power_cycle(), &guc, p);
+                    self.bilgi_satir(ui, dil.smart_health(), dil.translate_health(&d.saglik), p);
                 });
 
-                kart_ic(&mut kols[1], "KRİTİK SMART", p, |ui| {
+                kart_ic(&mut kols[1], dil.critical_smart(), p, |ui| {
                     if self.smart_attrs.is_empty() {
-                        ui.label(RichText::new("Yükleniyor...").italics().color(p.metin_soluk));
+                        ui.label(RichText::new(dil.loading()).italics().color(p.metin_soluk));
                     } else {
-                        let onemli = [(5u32, "Reallocated"), (197, "Pending"), (198, "Uncorrect"), (199, "CRC/Kablo"), (196, "Realloc Event"), (187, "Reported"), (188, "Timeout")];
+                        let onemli = [(5u32, "Reallocated"), (197, "Pending"), (198, "Uncorrect"), (199, "CRC/Cable"), (196, "Realloc Event"), (187, "Reported"), (188, "Timeout")];
                         for (id, isim) in onemli {
                             if let Some(a) = self.smart_attrs.iter().find(|x| x.id == id) {
                                 let renk = if a.raw > 0 {
@@ -845,13 +846,13 @@ impl HddDoktorApp {
 
             if let Some(s) = &self.saglik {
                 ui.add_space(10.0);
-                kart_ic(ui, "SAĞLIK ANALİZİ", p, |ui| {
+                kart_ic(ui, dil.health_analysis(), p, |ui| {
                     for sb in &s.sebep {
                         ui.label(format!("- {}", sb));
                     }
                     if !s.oneri.is_empty() {
                         ui.add_space(6.0);
-                        ui.label(RichText::new("ONERILEN AKSIYON").strong().color(p.mavi));
+                        ui.label(RichText::new(dil.recommended_action()).strong().color(p.mavi));
                         for o in &s.oneri {
                             ui.colored_label(p.sari, format!("-> {}", o));
                         }
@@ -861,10 +862,10 @@ impl HddDoktorApp {
 
             if !self.sicaklik_gecmisi.is_empty() && self.sicaklik_gecmisi.len() > 3 {
                 ui.add_space(10.0);
-                kart_ic(ui, "SICAKLIK GRAFIGI", p, |ui| {
+                kart_ic(ui, dil.temp_chart(), p, |ui| {
                     use egui_plot::{Line, Plot, PlotPoints};
                     let noktalar: PlotPoints = self.sicaklik_gecmisi.iter().map(|(x, y)| [*x as f64, *y as f64]).collect();
-                    Plot::new("sıcaklık_plot")
+                    Plot::new("temp_plot")
                         .height(140.0)
                         .allow_zoom(false)
                         .allow_drag(false)
@@ -877,10 +878,11 @@ impl HddDoktorApp {
     }
 
     fn sekme_smart(&self, ui: &mut egui::Ui, p: &tema::Palet) {
+        let dil = self.dil;
         if self.smart_attrs.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
-                ui.label(RichText::new("SMART verisi yok").color(p.metin_soluk));
+                ui.label(RichText::new(dil.no_smart_data()).color(p.metin_soluk));
             });
             return;
         }
@@ -896,17 +898,17 @@ impl HddDoktorApp {
                         .striped(true)
                         .spacing([14.0, 4.0])
                         .show(ui, |ui| {
-                            for h in ["ID", "İsim", "Değer", "Kötü", "Eşik", "Ham", "Durum"] {
+                            for h in [dil.col_id(), dil.col_name(), dil.col_value(), dil.col_worst(), dil.col_thresh(), dil.col_raw(), dil.col_status()] {
                                 ui.label(RichText::new(h).strong().color(p.mavi));
                             }
                             ui.end_row();
 
                             for a in &self.smart_attrs {
-                                let (durum, renk) = durum_hesapla(a, p);
+                                let (durum, renk) = durum_hesapla(a, p, dil);
                                 ui.label(RichText::new(a.id.to_string()).monospace())
-                                    .on_hover_text(bildirim::attribute_aciklamasi(a.id));
+                                    .on_hover_text(dil.attr_desc(a.id));
                                 ui.label(RichText::new(&a.name).monospace())
-                                    .on_hover_text(bildirim::attribute_aciklamasi(a.id));
+                                    .on_hover_text(dil.attr_desc(a.id));
                                 ui.label(RichText::new(a.value.to_string()).monospace());
                                 ui.label(RichText::new(a.worst.to_string()).monospace());
                                 ui.label(RichText::new(a.thresh.to_string()).monospace());
@@ -920,33 +922,34 @@ impl HddDoktorApp {
     }
 
     fn sekme_testler(&mut self, ui: &mut egui::Ui, p: &tema::Palet) {
+        let dil = self.dil;
         let disk_var = self.secili.is_some() && !self.calisiyor;
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            kart_ic(ui, "TESTLERI BASLAT", p, |ui| {
+            kart_ic(ui, dil.run_tests(), p, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    if ui.add_enabled(disk_var, egui::Button::new("Kısa Self-Test (~2 dk)")).clicked() {
+                    if ui.add_enabled(disk_var, egui::Button::new(dil.short_test())).clicked() {
                         self.self_test_baslat("short");
                     }
-                    if ui.add_enabled(disk_var, egui::Button::new("Uzun Self-Test (saatler)")).clicked() {
+                    if ui.add_enabled(disk_var, egui::Button::new(dil.long_test())).clicked() {
                         self.self_test_baslat("long");
                     }
-                    if ui.add_enabled(disk_var, egui::Button::new("Test Sonuçlarını Getir")).clicked() {
+                    if ui.add_enabled(disk_var, egui::Button::new(dil.get_results())).clicked() {
                         self.test_sonuclari();
                     }
-                    if ui.add_enabled(disk_var, egui::Button::new("Hata Log'unu Göster")).clicked() {
+                    if ui.add_enabled(disk_var, egui::Button::new(dil.show_error_log())).clicked() {
                         self.hata_log_goster();
                     }
                 });
                 ui.add_space(4.0);
-                ui.label(RichText::new("Kısayol: Ctrl+T kisa test | F5 yenile | Esc iptal").size(11.0).color(p.metin_soluk));
+                ui.label(RichText::new(dil.shortcuts()).size(11.0).color(p.metin_soluk));
             });
 
             ui.add_space(10.0);
 
             if self.uzun_metinler.is_empty() {
-                kart_ic(ui, "ÇIKTILAR", p, |ui| {
-                    ui.label(RichText::new("Henuz çıktı yok. Bir işlem çalıştırin.").color(p.metin_soluk));
+                kart_ic(ui, dil.outputs(), p, |ui| {
+                    ui.label(RichText::new(dil.no_output_yet()).color(p.metin_soluk));
                 });
             } else {
                 let mut sil: Option<usize> = None;
@@ -956,10 +959,10 @@ impl HddDoktorApp {
                         .id_salt(i)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                if ui.small_button("Kopyala").clicked() {
+                                if ui.small_button(dil.copy()).clicked() {
                                     ui.output_mut(|o| o.copied_text = icerik.clone());
                                 }
-                                if ui.small_button("Sil").clicked() {
+                                if ui.small_button(dil.delete()).clicked() {
                                     sil = Some(i);
                                 }
                             });
@@ -979,18 +982,19 @@ impl HddDoktorApp {
     }
 
     fn sekme_bakim(&mut self, ui: &mut egui::Ui, p: &tema::Palet) {
+        let dil = self.dil;
         let disk_var = self.secili.is_some() && !self.calisiyor;
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            kart_ic(ui, "GÜVENLİ İŞLEMLER", p, |ui| {
+            kart_ic(ui, dil.safe_ops(), p, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    if ui.add_enabled(disk_var, egui::Button::new("SMART Yenile (F5)")).clicked() {
+                    if ui.add_enabled(disk_var, egui::Button::new(dil.smart_refresh())).clicked() {
                         self.smart_yukle();
                     }
-                    if ui.add_enabled(disk_var, egui::Button::new("Trend Kaydet")).clicked() {
+                    if ui.add_enabled(disk_var, egui::Button::new(dil.trend_save())).clicked() {
                         self.trend_kaydet();
                     }
-                    if ui.add_enabled(disk_var, egui::Button::new("Trend Göster")).clicked() {
+                    if ui.add_enabled(disk_var, egui::Button::new(dil.trend_show())).clicked() {
                         self.trend_goster();
                     }
                 });
@@ -1004,33 +1008,33 @@ impl HddDoktorApp {
                 .inner_margin(egui::Margin::same(14.0))
                 .stroke(egui::Stroke::new(2.0, p.kirmizi))
                 .show(ui, |ui| {
-                    ui.label(RichText::new("TEHLİKELİ ONARIM - VERI SİLİNİR").strong().color(p.kirmizi).size(14.0));
+                    ui.label(RichText::new(dil.danger_title()).strong().color(p.kirmizi).size(14.0));
                     ui.add_space(6.0);
-                    ui.label(RichText::new("Zero-Fill diski bastan sona sıfırla doldurur; bad sector'lari remap tetikler.").color(p.metin_soluk));
-                    ui.label(RichText::new("Secure Erase ATA komutu ile fabrika sıfırlamasi yapar.").color(p.metin_soluk));
+                    ui.label(RichText::new(dil.zerofill_desc()).color(p.metin_soluk));
+                    ui.label(RichText::new(dil.secure_erase_desc()).color(p.metin_soluk));
                     ui.add_space(8.0);
 
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Silme Deseni:").strong());
+                        ui.label(RichText::new(dil.wipe_pattern()).strong());
                         egui::ComboBox::from_id_salt("wipe_pattern")
-                            .selected_text(self.secili_wipe.etiket())
+                            .selected_text(self.secili_wipe.etiket(dil))
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.secili_wipe, disk::WipePattern::Zero, disk::WipePattern::Zero.etiket());
-                                ui.selectable_value(&mut self.secili_wipe, disk::WipePattern::Random, disk::WipePattern::Random.etiket());
-                                ui.selectable_value(&mut self.secili_wipe, disk::WipePattern::DoD3, disk::WipePattern::DoD3.etiket());
-                                ui.selectable_value(&mut self.secili_wipe, disk::WipePattern::Gutmann, disk::WipePattern::Gutmann.etiket());
+                                ui.selectable_value(&mut self.secili_wipe, disk::WipePattern::Zero, disk::WipePattern::Zero.etiket(dil));
+                                ui.selectable_value(&mut self.secili_wipe, disk::WipePattern::Random, disk::WipePattern::Random.etiket(dil));
+                                ui.selectable_value(&mut self.secili_wipe, disk::WipePattern::DoD3, disk::WipePattern::DoD3.etiket(dil));
+                                ui.selectable_value(&mut self.secili_wipe, disk::WipePattern::Gutmann, disk::WipePattern::Gutmann.etiket(dil));
                             });
                     });
                     ui.add_space(4.0);
 
-                    ui.checkbox(&mut self.onay_zerofill, "Silme için veri kaybını kabul ediyorum");
-                    if ui.add_enabled(disk_var && self.onay_zerofill, egui::Button::new(RichText::new("Silme Başlat").color(p.kirmizi))).clicked() {
+                    ui.checkbox(&mut self.onay_zerofill, dil.accept_wipe());
+                    if ui.add_enabled(disk_var && self.onay_zerofill, egui::Button::new(RichText::new(dil.start_wipe()).color(p.kirmizi))).clicked() {
                         self.wipe_baslat();
                         self.onay_zerofill = false;
                     }
                     ui.add_space(4.0);
-                    ui.checkbox(&mut self.onay_erase, "Secure Erase için veri kaybını kabul ediyorum");
-                    if ui.add_enabled(disk_var && self.onay_erase, egui::Button::new(RichText::new("Secure Erase Başlat").color(p.kirmizi))).clicked() {
+                    ui.checkbox(&mut self.onay_erase, dil.accept_erase());
+                    if ui.add_enabled(disk_var && self.onay_erase, egui::Button::new(RichText::new(dil.start_erase()).color(p.kirmizi))).clicked() {
                         self.secure_erase_baslat();
                         self.onay_erase = false;
                     }
@@ -1038,18 +1042,18 @@ impl HddDoktorApp {
 
             ui.add_space(10.0);
 
-            kart_ic(ui, "WINDOWS CHKDSK", p, |ui| {
-                ui.label("Windows dosya sistemi tarayıcısı. Sürücü harfi için çalıştırır (yönetici gerekli).");
+            kart_ic(ui, dil.chkdsk_title(), p, |ui| {
+                ui.label(dil.chkdsk_desc());
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    ui.label("Sürücü Harfi:");
+                    ui.label(dil.drive_letter());
                     let cvp = egui::TextEdit::singleline(&mut self.chkdsk_surucu).desired_width(40.0);
                     ui.add(cvp);
                     ui.label(":");
-                    if ui.add_enabled(!self.calisiyor, egui::Button::new("Chkdsk /f (hızlı)")).clicked() {
+                    if ui.add_enabled(!self.calisiyor, egui::Button::new(dil.chkdsk_quick())).clicked() {
                         self.chkdsk_baslat(false);
                     }
-                    if ui.add_enabled(!self.calisiyor, egui::Button::new("Chkdsk /r (tam tarama, uzun)")).clicked() {
+                    if ui.add_enabled(!self.calisiyor, egui::Button::new(dil.chkdsk_full())).clicked() {
                         self.chkdsk_baslat(true);
                     }
                 });
@@ -1058,44 +1062,44 @@ impl HddDoktorApp {
     }
 
     fn sekme_trend(&mut self, ui: &mut egui::Ui, p: &tema::Palet) {
+        let dil = self.dil;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            kart_ic(ui, "TREND IZLEME", p, |ui| {
-                ui.label("Zaman içinde SMART değerlerinin nasil değiştiğini kaydeder ve karşılaştırir.");
+            kart_ic(ui, dil.trend_title(), p, |ui| {
+                ui.label(dil.trend_desc());
                 ui.add_space(6.0);
                 let disk_var = self.secili.is_some() && !self.calisiyor;
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(disk_var, egui::Button::new("Bu Anin Kaydını Al")).clicked() {
+                    if ui.add_enabled(disk_var, egui::Button::new(dil.save_snapshot())).clicked() {
                         self.trend_kaydet();
                     }
-                    if ui.add_enabled(disk_var, egui::Button::new("Karşılaştır")).clicked() {
+                    if ui.add_enabled(disk_var, egui::Button::new(dil.compare())).clicked() {
                         self.trend_goster();
                     }
                 });
             });
 
             ui.add_space(10.0);
-            kart_ic(ui, "İPUÇLARI", p, |ui| {
-                ui.label("- Önce bugunun kaydını al");
-                ui.label("- SATA/USB kablosunu değiştir");
-                ui.label("- 1 hafta sonra tekrar kaydet + karşılaştır");
-                ui.label("- Kritik SMART (5, 197, 198, 199) artmıyorsa disk sağlıklı");
-                ui.label("- Otomatik yenile checkbox'i ile 30 sn'de bir izlenir");
+            kart_ic(ui, dil.tips(), p, |ui| {
+                for line in dil.tip_lines() {
+                    ui.label(line);
+                }
             });
         });
     }
 
     fn sekme_rapor(&mut self, ui: &mut egui::Ui, d: &DiskInfo, p: &tema::Palet) {
+        let dil = self.dil;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            kart_ic(ui, "RAPOR (Metin)", p, |ui| {
+            kart_ic(ui, dil.report_text(), p, |ui| {
                 let rapor = self.rapor_metni(d);
                 ui.horizontal(|ui| {
-                    if ui.button("Kopyala").clicked() {
+                    if ui.button(dil.copy()).clicked() {
                         ui.output_mut(|o| o.copied_text = rapor.clone());
                     }
-                    if ui.button("HTML Rapor Kaydet").clicked() {
+                    if ui.button(dil.save_html()).clicked() {
                         self.html_rapor_kaydet();
                     }
-                    if ui.button("CSV Kaydet").clicked() {
+                    if ui.button(dil.save_csv()).clicked() {
                         self.csv_kaydet();
                     }
                 });
@@ -1113,12 +1117,13 @@ impl HddDoktorApp {
         let attrs = self.smart_attrs.clone();
         let saglik = self.saglik.clone();
         let tx = self.tx.clone();
-        thread::spawn(move || match rapor::html_rapor(&d, &attrs, saglik.as_ref()) {
+        let dil = self.dil;
+        thread::spawn(move || match rapor::html_rapor(&d, &attrs, saglik.as_ref(), dil) {
             Ok(p) => {
-                let _ = tx.send(WorkerMsg::Log(LogMsg::Ok(format!("HTML kaydedildi: {}", p.display()))));
+                let _ = tx.send(WorkerMsg::Log(LogMsg::Ok(dil.html_saved(&p.display().to_string()))));
             }
             Err(e) => {
-                let _ = tx.send(WorkerMsg::Log(LogMsg::Err(format!("HTML hatası: {}", e))));
+                let _ = tx.send(WorkerMsg::Log(LogMsg::Err(dil.html_error(&e.to_string()))));
             }
         });
     }
@@ -1128,12 +1133,13 @@ impl HddDoktorApp {
         let d = self.diskler[idx].clone();
         let attrs = self.smart_attrs.clone();
         let tx = self.tx.clone();
+        let dil = self.dil;
         thread::spawn(move || match rapor::csv_export(&d, &attrs) {
             Ok(p) => {
-                let _ = tx.send(WorkerMsg::Log(LogMsg::Ok(format!("CSV kaydedildi: {}", p.display()))));
+                let _ = tx.send(WorkerMsg::Log(LogMsg::Ok(dil.csv_saved(&p.display().to_string()))));
             }
             Err(e) => {
-                let _ = tx.send(WorkerMsg::Log(LogMsg::Err(format!("CSV hatası: {}", e))));
+                let _ = tx.send(WorkerMsg::Log(LogMsg::Err(dil.csv_error(&e.to_string()))));
             }
         });
     }
@@ -1143,9 +1149,10 @@ impl HddDoktorApp {
         let d = self.diskler[idx].clone();
         let pattern = self.secili_wipe;
         let tx = self.tx.clone();
+        let dil = self.dil;
         self.calisiyor = true;
         self.iptal_bayragi.store(false, Ordering::Relaxed);
-        self.ilerleme = Some((0.0, format!("{} başlatılıyor...", pattern.etiket())));
+        self.ilerleme = Some((0.0, format!("{} {}", pattern.etiket(dil), dil.starting())));
         let iptal = self.iptal_bayragi.clone();
 
         thread::spawn(move || {
@@ -1155,15 +1162,15 @@ impl HddDoktorApp {
             };
             match disk::wipe(&d.yol, pattern, iptal, cb) {
                 Ok(_) => {
-                    let _ = tx.send(WorkerMsg::Log(LogMsg::Ok(format!("{} tamamlandı", pattern.etiket()))));
+                    let _ = tx.send(WorkerMsg::Log(LogMsg::Ok(dil.wipe_done(pattern.etiket(dil)))));
                     let _ = tx.send(WorkerMsg::Bildirim(
-                        "Silme Bitti".into(),
-                        format!("{} tamamlandı", pattern.etiket()),
+                        dil.wipe_done_notif().into(),
+                        dil.wipe_done(pattern.etiket(dil)),
                         false,
                     ));
                 }
                 Err(e) => {
-                    let _ = tx.send(WorkerMsg::Log(LogMsg::Err(format!("Silme hatası: {}", e))));
+                    let _ = tx.send(WorkerMsg::Log(LogMsg::Err(dil.wipe_error(&e.to_string()))));
                 }
             }
             let _ = tx.send(WorkerMsg::ProgressDone);
@@ -1173,6 +1180,7 @@ impl HddDoktorApp {
     fn chkdsk_baslat(&mut self, tam_tara: bool) {
         let harf = self.chkdsk_surucu.clone();
         let tx = self.tx.clone();
+        let dil = self.dil;
         self.calisiyor = true;
         thread::spawn(move || match disk::chkdsk_calistir(&harf, tam_tara) {
             Ok(s) => {
@@ -1183,7 +1191,7 @@ impl HddDoktorApp {
                 let _ = tx.send(WorkerMsg::ProgressDone);
             }
             Err(e) => {
-                let _ = tx.send(WorkerMsg::Log(LogMsg::Err(format!("Chkdsk hatası: {}", e))));
+                let _ = tx.send(WorkerMsg::Log(LogMsg::Err(dil.chkdsk_error(&e.to_string()))));
                 let _ = tx.send(WorkerMsg::ProgressDone);
             }
         });
@@ -1191,39 +1199,40 @@ impl HddDoktorApp {
 
     fn rapor_metni(&self, d: &DiskInfo) -> String {
         use std::fmt::Write;
+        let dil = self.dil;
         let mut s = String::new();
-        let _ = writeln!(s, "=== HDD DOKTOR RAPORU ===");
-        let _ = writeln!(s, "Tarih: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
+        let rapor_baslik = match dil { Dil::Tr => "HDD DOKTOR RAPORU", Dil::En => "HDD DOKTOR REPORT" };
+        let tarih_lbl = match dil { Dil::Tr => "Tarih", Dil::En => "Date" };
+        let _ = writeln!(s, "=== {} ===", rapor_baslik);
+        let _ = writeln!(s, "{}: {}", tarih_lbl, chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
         let _ = writeln!(s);
-        let _ = writeln!(s, "-- Genel --");
-        let _ = writeln!(s, "Model      : {}", d.model);
-        let _ = writeln!(s, "Seri       : {}", d.seri);
-        let _ = writeln!(s, "Firmware   : {}", d.firmware);
-        let _ = writeln!(s, "Kapasite   : {:.1} GB", d.kapasite_gb);
-        let _ = writeln!(s, "Tip        : {}", d.tip);
-        let _ = writeln!(s, "Bağlantı   : {}", d.baglanti);
-        let _ = writeln!(s, "Sıcaklık   : {} C", d.sicaklik.unwrap_or(0));
-        let _ = writeln!(s, "Çalışma    : {} saat", d.cikis_saati.unwrap_or(0));
-        let _ = writeln!(s, "Güç Cycle  : {}", d.guc_dongusu.unwrap_or(0));
+        let _ = writeln!(s, "-- {} --", dil.general());
+        let _ = writeln!(s, "{:<18}: {}", dil.model(), d.model);
+        let _ = writeln!(s, "{:<18}: {}", dil.serial(), d.seri);
+        let _ = writeln!(s, "{:<18}: {}", dil.firmware(), d.firmware);
+        let _ = writeln!(s, "{:<18}: {:.1} GB", dil.capacity(), d.kapasite_gb);
+        let _ = writeln!(s, "{:<18}: {}", dil.disk_type(), d.tip);
+        let _ = writeln!(s, "{:<18}: {}", dil.conn_label(), dil.translate_conn(&d.baglanti));
+        let _ = writeln!(s, "{:<18}: {} °C", dil.temperature(), d.sicaklik.unwrap_or(0));
+        let _ = writeln!(s, "{:<18}: {} h", dil.uptime(), d.cikis_saati.unwrap_or(0));
+        let _ = writeln!(s, "{:<18}: {}", dil.power_cycle(), d.guc_dongusu.unwrap_or(0));
         let _ = writeln!(s);
         if let Some(sa) = &self.saglik {
-            let _ = writeln!(s, "-- Sağlık --");
-            let _ = writeln!(s, "Puan       : {}/100  ({})", sa.puan, sa.durum.etiket());
+            let _ = writeln!(s, "-- {} --", dil.health_analysis());
+            let _ = writeln!(s, "{:<18}: {}/100  ({})", "Score", sa.puan, sa.durum.etiket(dil));
             if let Some(y) = sa.kalan_omur_yil {
-                let _ = writeln!(s, "Tahmini ömür: ~{:.1} yil", y);
+                let _ = writeln!(s, "{}", dil.est_life(y));
             }
-            let _ = writeln!(s, "Sebepler:");
             for sb in &sa.sebep {
                 let _ = writeln!(s, "  - {}", sb);
             }
-            let _ = writeln!(s, "Öneriler:");
             for o in &sa.oneri {
                 let _ = writeln!(s, "  -> {}", o);
             }
             let _ = writeln!(s);
         }
         let _ = writeln!(s, "-- SMART Attributes --");
-        let _ = writeln!(s, "{:>4} {:<28} {:>5} {:>5} {:>5} {:>10}", "ID", "İsim", "Val", "Wst", "Thr", "Ham");
+        let _ = writeln!(s, "{:>4} {:<28} {:>5} {:>5} {:>5} {:>10}", "ID", dil.col_name(), dil.col_value(), dil.col_worst(), dil.col_thresh(), dil.col_raw());
         for a in &self.smart_attrs {
             let _ = writeln!(s, "{:>4} {:<28} {:>5} {:>5} {:>5} {:>10}", a.id, a.name, a.value, a.worst, a.thresh, a.raw);
         }
@@ -1238,7 +1247,7 @@ impl HddDoktorApp {
     }
 }
 
-fn disk_kart(ui: &mut egui::Ui, d: &DiskInfo, secili: bool, p: &tema::Palet) -> bool {
+fn disk_kart(ui: &mut egui::Ui, d: &DiskInfo, secili: bool, p: &tema::Palet, dil: Dil) -> bool {
     let baski = 1.0 + if secili { 1.0 } else { 0.0 };
     let ic_renk = if secili { p.arka_vurgu } else { p.arka_kart };
     let stroke_renk = if secili { p.mavi } else { p.cizgi };
@@ -1251,7 +1260,7 @@ fn disk_kart(ui: &mut egui::Ui, d: &DiskInfo, secili: bool, p: &tema::Palet) -> 
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                let saglik_renk = if d.saglik.contains("SAĞLIKLI") { p.yesil } else if d.saglik.contains("SORUNLU") { p.kirmizi } else { p.metin_soluk };
+                let saglik_renk = if d.saglik == "PASSED" { p.yesil } else if d.saglik == "FAILED" { p.kirmizi } else { p.metin_soluk };
                 ui.label(RichText::new("*").size(18.0).color(saglik_renk));
                 ui.vertical(|ui| {
                     let kisa = if d.model.len() > 26 { format!("{}...", &d.model[..26]) } else { d.model.clone() };
@@ -1261,7 +1270,7 @@ fn disk_kart(ui: &mut egui::Ui, d: &DiskInfo, secili: bool, p: &tema::Palet) -> 
                         ui.label(RichText::new("|").size(11.0).color(p.metin_soluk));
                         ui.label(RichText::new(&d.tip).size(11.0).color(p.metin_soluk));
                     });
-                    let baglanti_kisa = if d.baglanti.starts_with("USB") { "USB" } else if d.baglanti == "Doğrudan" { "SATA" } else { d.baglanti.as_str() };
+                    let baglanti_kisa = dil.conn_short(&d.baglanti);
                     ui.label(RichText::new(baglanti_kisa).size(10.0).color(p.mavi));
                 });
             });
@@ -1297,16 +1306,16 @@ fn kart_ic<R>(ui: &mut egui::Ui, baslik: &str, p: &tema::Palet, ic: impl FnOnce(
         .inner
 }
 
-fn durum_hesapla(a: &SmartAttribute, p: &tema::Palet) -> (String, Color32) {
+fn durum_hesapla(a: &SmartAttribute, p: &tema::Palet, dil: Dil) -> (String, Color32) {
     if !a.when_failed.is_empty() && a.when_failed != "-" {
-        return ("HATA".into(), p.kirmizi);
+        return (dil.status_error().into(), p.kirmizi);
     }
     if a.thresh > 0 && a.value <= a.thresh {
-        return ("KRİTİK".into(), p.kirmizi);
+        return (dil.status_critical().into(), p.kirmizi);
     }
     let kritik = matches!(a.id, 5 | 187 | 188 | 197 | 198 | 199 | 196);
     if kritik && a.raw > 0 {
-        return ("DİKKAT".into(), p.sari);
+        return (dil.status_warning().into(), p.sari);
     }
-    ("Sorunsuz".into(), p.yesil)
+    (dil.status_ok().into(), p.yesil)
 }
